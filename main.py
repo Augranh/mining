@@ -121,89 +121,148 @@ def check_xmrig_installed():
 
 
 def download_xmrig():
-    """Automatically download and set up XMRig."""
+    """Automatically download and set up XMRig.
+
+    This implementation downloads with retries, writes the archive in chunks,
+    and extracts archives safely (no tarfile.extractall call) to avoid the
+    Python 3.14 tarfile deprecation warning and to prevent path traversal.
+    """
     import urllib.request
     import zipfile
     import tarfile
     import shutil
-    
+    import tempfile
+    import time
+
     system = platform.system()
     script_dir = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("⚠️  XMRig not found - Starting automatic download...")
-    print("="*60)
-    
+    print("=" * 60)
+
     url = XMRIG_URLS.get(system)
     if not url:
         print(f"❌ No download URL available for {system}")
         return False
-    
-    try:
-        # Download XMRig
-        print(f"📥 Downloading XMRig {XMRIG_VERSION} from GitHub...")
-        print(f"   URL: {url}")
-        filename = os.path.join(script_dir, url.split('/')[-1])
-        
-        # Show download progress
-        def reporthook(blocknum, blocksize, totalsize):
-            readsofar = blocknum * blocksize
-            if totalsize > 0:
-                percent = readsofar * 100 / totalsize
-                s = f"\r   Progress: {percent:5.1f}% ({readsofar}/{totalsize} bytes)"
-                sys.stderr.write(s)
-                if readsofar >= totalsize:
+
+    filename = os.path.join(script_dir, url.split('/')[-1])
+    retries = 3
+
+    # Download with retries and chunked write
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "xmrig-setup/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total = resp.getheader('Content-Length')
+                total = int(total) if total and total.isdigit() else None
+                downloaded = 0
+                chunk_size = 8192
+                with open(filename, 'wb') as out:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            pct = downloaded * 100 / total
+                            sys.stderr.write(f"\r   Progress: {pct:5.1f}% ({downloaded}/{total} bytes)")
+                        else:
+                            sys.stderr.write(f"\r   Downloaded: {downloaded} bytes")
                     sys.stderr.write("\n")
-            else:
-                sys.stderr.write(f"\r   Downloaded: {readsofar} bytes")
-        
-        urllib.request.urlretrieve(url, filename, reporthook)
-        print("✅ Download complete!")
-        
-        # Extract archive
+            print("✅ Download complete!")
+            break
+
+        except Exception as e:
+            print(f"❌ Download attempt {attempt} failed: {e}")
+            if attempt == retries:
+                print("❌ All download attempts failed.\nPlease check network access to GitHub or download XMRig manually.")
+                return False
+            backoff = 2 ** attempt
+            print(f"⏳ Retrying in {backoff}s...")
+            time.sleep(backoff)
+
+    # Extract archive safely
+    extract_dir = tempfile.mkdtemp(prefix='xmrig_')
+    try:
         print("📦 Extracting archive...")
-        extract_dir = os.path.join(script_dir, "xmrig_temp")
-        
+
         if filename.endswith('.zip'):
             with zipfile.ZipFile(filename, 'r') as zip_ref:
                 zip_ref.extractall(extract_dir)
-        elif filename.endswith('.tar.gz'):
+
+        elif filename.endswith(('.tar.gz', '.tgz')):
             with tarfile.open(filename, 'r:gz') as tar_ref:
-                tar_ref.extractall(extract_dir)
+                # Safe extraction: iterate members and write files manually to avoid
+                # extractall-related deprecation and to prevent path traversal.
+                for member in tar_ref.getmembers():
+                    member_name = member.name
+                    # Skip absolute paths and parent references
+                    if member_name.startswith('/') or '..' in member_name.split(os.path.sep):
+                        print(f"⚠️  Skipping suspicious archive entry: {member_name}")
+                        continue
+
+                    target_path = os.path.join(extract_dir, member_name)
+                    if member.isdir():
+                        os.makedirs(target_path, exist_ok=True)
+                        continue
+
+                    if member.issym() or member.islnk():
+                        print(f"⚠️  Skipping symlink/lnk in archive: {member_name}")
+                        continue
+
+                    fileobj = tar_ref.extractfile(member)
+                    if fileobj is None:
+                        # Nothing to extract (e.g., pax global header)
+                        continue
+
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    with open(target_path, 'wb') as out_f:
+                        shutil.copyfileobj(fileobj, out_f)
+
         else:
             print(f"❌ Unknown archive format: {filename}")
             return False
-        
+
         print("✅ Extraction complete!")
-        
+
         # Find and move xmrig executable
         print("🔍 Locating XMRig executable...")
         xmrig_exe = "xmrig.exe" if system == "Windows" else "xmrig"
         xmrig_found = False
-        
+
         for root, dirs, files in os.walk(extract_dir):
             if xmrig_exe in files:
                 source = os.path.join(root, xmrig_exe)
                 destination = os.path.join(script_dir, xmrig_exe)
-                
+
                 print(f"📋 Moving {xmrig_exe} to script directory...")
                 shutil.move(source, destination)
-                
+
                 # Make executable on Unix systems
                 if system != "Windows":
-                    os.chmod(destination, 0o755)
-                    print("✅ Made executable")
-                
+                    try:
+                        os.chmod(destination, 0o755)
+                        print("✅ Made executable")
+                    except Exception:
+                        print("⚠️  Could not set executable flag on the binary")
+
                 xmrig_found = True
                 break
-        
+
         # Clean up
         print("🧹 Cleaning up temporary files...")
-        if os.path.exists(filename):
-            os.remove(filename)
-        if os.path.exists(extract_dir):
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+        except Exception:
+            pass
+        try:
             shutil.rmtree(extract_dir)
-        
+        except Exception:
+            pass
+
         if xmrig_found:
             print("✅ XMRig setup complete!")
             print(f"   Location: {os.path.join(script_dir, xmrig_exe)}")
@@ -211,11 +270,21 @@ def download_xmrig():
         else:
             print(f"❌ Could not find {xmrig_exe} in extracted files")
             return False
-            
+
     except Exception as e:
-        print(f"❌ Error during download/setup: {e}")
+        print(f"❌ Error during extraction/setup: {e}")
         import traceback
         traceback.print_exc()
+        # Attempt cleanup
+        try:
+            if os.path.exists(filename):
+                os.remove(filename)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(extract_dir)
+        except Exception:
+            pass
         return False
 
 
